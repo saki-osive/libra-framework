@@ -61,6 +61,7 @@ use libra_wallet::{
 use move_core_types::value::MoveValue;
 use serde::Deserialize;
 use std::{fs, mem::ManuallyDrop, path::Path};
+use diem_forge::ShouldFail::No;
 
 #[derive(Parser)]
 
@@ -78,16 +79,20 @@ pub struct TwinOpts {
     /// provide info about the DB state, e.g. version
     #[clap(value_parser)]
     pub info: bool,
+    #[clap(value_parser)]
+    pub snapshot_file: Option<PathBuf>, // Add snapshot file option
 }
 
 impl TwinOpts {
     pub fn run(&self) -> anyhow::Result<(), anyhow::Error> {
         let db_path = &self.db_dir;
+        let snapshot_file = &self.snapshot_file; // Get the snapshot file path
         let num_val = 3_u8;
         let twin = Twin {
             db_dir: db_path.to_path_buf(),
             oper_file: self.oper_file.clone(),
             info: self.info,
+            snapshot_file: snapshot_file.clone(), // Pass the snapshot file to the Twin struct
         };
         twin.run()
     }
@@ -100,6 +105,7 @@ pub struct Twin {
     pub db_dir: PathBuf,
     pub oper_file: Option<PathBuf>,
     pub info: bool,
+    pub snapshot_file: Option<PathBuf>, // Add snapshot file field
 }
 
 /// '''
@@ -116,10 +122,12 @@ where
 {
     fn run(&self) -> anyhow::Result<(), anyhow::Error> {
         let db_path = &self.db_dir;
+        let snapshot_file = &self.snapshot_file;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let num_validators = 3_u8;
         runtime.block_on(Twin::apply_with_rando_e2e(
             db_path.to_path_buf(),
+            snapshot_file.clone(),
             num_validators,
         ));
         println!("Twins are running!");
@@ -148,9 +156,11 @@ trait TwinSetup {
     ) -> anyhow::Result<()>;
     async fn apply_with_rando_e2e(
         prod_db: PathBuf,
+        snapshot_file: Option<PathBuf>,
         num_validators: u8,
     ) -> anyhow::Result<LibraSmoke, anyhow::Error>;
     async fn extract_credentials(marlon_node: &LocalNode) -> anyhow::Result<ValCredentials>;
+    async fn clone_db_with_snapshot(snapshot_file: &Path, target: &Path) -> anyhow::Result<(), anyhow::Error>;
     fn clone_db(prod_db: &Path, swarm_db: &Path) -> anyhow::Result<()>;
     async fn wait_for_node(
         validator: &mut dyn Validator,
@@ -231,6 +241,7 @@ impl TwinSetup for Twin {
     /// '''
     async fn apply_with_rando_e2e(
         prod_db: PathBuf,
+        snapshot_file: Option<PathBuf>,
         num_validators: u8,
     ) -> anyhow::Result<LibraSmoke, anyhow::Error> {
         //The diem-node should be compiled externally to avoid any potential conflicts with the current build
@@ -264,9 +275,17 @@ impl TwinSetup for Twin {
             n.stop();
             n.clear_storage();
         });
-        swarm_db_paths.iter().for_each(|p| {
-            Self::clone_db(&prod_db, p).unwrap();
-        });
+        // Use snapshot file if provided
+        if let Some(snapshot_file) = snapshot_file {
+            swarm_db_paths.iter().for_each(|p| {
+                Self::clone_db_with_snapshot(&snapshot_file, p).unwrap();
+            });
+        } else {
+            swarm_db_paths.iter().for_each(|p| {
+                Self::clone_db(&prod_db, p).unwrap();
+            });
+        }
+
 
         swarm_db_paths.iter().for_each(|p| {
             assert!(p.exists());
@@ -444,6 +463,24 @@ impl TwinSetup for Twin {
         })
     }
 
+    async fn clone_db_with_snapshot(snapshot_file: &Path, target: &Path) -> anyhow::Result<(), anyhow::Error> {
+        println!("Cloning DB using snapshot file");
+        std::fs::create_dir_all(target)?;
+        let output = Command::new("tar")
+            .arg("-xvf")
+            .arg(snapshot_file)
+            .arg("-C")
+            .arg(target)
+            .output()
+            .await.expect("Failed to extract snapshot file");
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow::Error::msg(String::from_utf8_lossy(&output.stderr).to_string()))
+        }
+    }
+
     /// '''
     /// Clone the prod db to the swarm db
     /// '''
@@ -507,6 +544,7 @@ fn test_twin_cl() -> anyhow::Result<()> {
         db_dir: prod_db_to_clone,
         oper_file: None,
         info: false,
+        snapshot_file: None,
     };
     twin.run();
     Ok(())
@@ -516,7 +554,7 @@ fn test_twin_cl() -> anyhow::Result<()> {
 async fn test_twin_random() -> anyhow::Result<()> {
     //use any db
     let prod_db_to_clone = PathBuf::from("/root/.libra/db");
-    Twin::apply_with_rando_e2e(prod_db_to_clone, 3)
+    Twin::apply_with_rando_e2e(prod_db_to_clone, None, 3)
         .await
         .unwrap();
     Ok(())
