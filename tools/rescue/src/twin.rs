@@ -3,7 +3,9 @@ use crate::{diem_db_bootstrapper::BootstrapOpts, session_tools::session_add_vali
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
-use diem_config::config::{NodeConfig, WaypointConfig};
+use diem_config::config::{
+    NodeConfig, PrunerConfig, RocksdbConfig, RocksdbConfigs, WaypointConfig,
+};
 use diem_forge::{Swarm, SwarmExt, Validator};
 use diem_temppath::TempPath;
 use diem_types::{
@@ -42,15 +44,25 @@ use crate::{
     },
 };
 use diem_api_types::ViewRequest;
+use diem_backup_cli::{
+    backup_types::state_snapshot::restore::StateSnapshotRestoreController,
+    storage::local_fs::LocalFs, utils::GlobalRestoreOptions,
+};
 use diem_config::{config::InitialSafetyRulesConfig, keys::ConfigKey};
 use diem_crypto::{bls12381, bls12381::ProofOfPossession, ed25519::PrivateKey};
+use diem_db::DiemDB;
+use diem_db_tool::restore::{
+    Command as DiemCommand, DBToolStorageOpt, GlobalRestoreOpt, Oneoff, StateSnapshotRestoreOpt,
+};
 use diem_forge::{LocalNode, LocalVersion, Node, NodeExt, Version};
 use diem_genesis::{
     config::HostAndPort,
     keys::{PrivateIdentity, PublicIdentity},
 };
+use diem_storage_interface::DbReaderWriter;
 use diem_types::{on_chain_config::new_epoch_event_key, waypoint::Waypoint};
 use diem_vm::move_vm_ext::SessionExt;
+use git2::Repository;
 use hex::{self, FromHex};
 use libra_config::validator_config;
 use libra_query::query_view;
@@ -60,7 +72,7 @@ use libra_wallet::{
 };
 use move_core_types::value::MoveValue;
 use serde::Deserialize;
-use std::{fs, mem::ManuallyDrop, path::Path};
+use std::{fs, mem::ManuallyDrop, path::Path, sync::Arc, time::UNIX_EPOCH};
 
 #[derive(Parser)]
 
@@ -78,14 +90,18 @@ pub struct TwinOpts {
     /// provide info about the DB state, e.g. version
     #[clap(value_parser)]
     pub info: bool,
+    #[clap(value_parser)]
+    pub snapshot_path: Option<PathBuf>,
 }
 
 impl TwinOpts {
     pub fn run(&self) -> anyhow::Result<(), anyhow::Error> {
         let db_path = &self.db_dir;
+        let snapshot_path = &self.snapshot_path;
         let num_val = 3_u8;
         let twin = Twin {
             db_dir: db_path.to_path_buf(),
+            snapshot_path: snapshot_path.clone(),
             oper_file: self.oper_file.clone(),
             info: self.info,
         };
@@ -100,6 +116,7 @@ pub struct Twin {
     pub db_dir: PathBuf,
     pub oper_file: Option<PathBuf>,
     pub info: bool,
+    pub snapshot_path: Option<PathBuf>,
 }
 
 /// '''
@@ -116,8 +133,14 @@ where
 {
     fn run(&self) -> anyhow::Result<(), anyhow::Error> {
         let db_path = &self.db_dir;
+        let snapshot_path = &self.snapshot_path;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let num_validators = 3_u8;
+
+        if let Some(snapshot_path) = snapshot_path {
+            runtime.block_on(Twin::load_snapshot_into_db(snapshot_path, db_path))?;
+        }
+
         runtime.block_on(Twin::apply_with_rando_e2e(
             db_path.to_path_buf(),
             num_validators,
@@ -156,6 +179,7 @@ pub trait TwinSetup {
         validator: &mut dyn Validator,
         expected_to_connect: usize,
     ) -> anyhow::Result<()>;
+    async fn load_snapshot_into_db(snapshot_path: &Path, db_path: &Path) -> anyhow::Result<()>;
 }
 #[async_trait]
 impl TwinSetup for Twin {
@@ -504,9 +528,148 @@ impl TwinSetup for Twin {
             .await?;
         Ok(())
     }
+
+    async fn load_snapshot_into_db(snapshot_path: &Path, db_path: &Path) -> anyhow::Result<()> {
+
+        let snapshots_repo = "https://github.com/0LNetworkCommunity/epoch-archive-mainnet.git";
+        let snapshots_dir = "snapshots";
+
+        // Step 1: Clone or update the snapshots repository
+        if Path::new(snapshots_dir).exists() {
+            println!("Pulling latest snapshots...");
+            let repo =
+                Repository::open(snapshots_dir).expect("Failed to open snapshots repository");
+            let mut remote = repo.find_remote("origin").expect("Failed to find remote");
+            remote
+                .fetch(&["refs/heads/v7.0.0"], None, None)
+                .expect("Failed to fetch latest snapshots");
+        } else {
+            println!("Cloning snapshots repository...");
+            Repository::clone(snapshots_repo, snapshots_dir)
+                .expect("Failed to clone snapshots repository");
+        }
+
+        // Step 2: Find the latest snapshot
+        let entries = fs::read_dir(snapshots_dir).expect("Failed to read snapshots directory");
+        let mut latest_snapshot: Option<PathBuf> = None;
+        let mut latest_time = 0;
+
+        for entry in entries {
+            let entry = entry.expect("Failed to read directory entry");
+            let metadata = entry.metadata().expect("Failed to read metadata");
+            let modified = metadata.modified().expect("Failed to get modified time");
+
+            let modified_time = modified.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if modified_time > latest_time {
+                latest_time = modified_time;
+                latest_snapshot = Some(entry.path());
+            }
+        }
+
+        let latest_snapshot_path = latest_snapshot.expect("No snapshots found");
+        println!("Latest snapshot found at: {:?}", latest_snapshot_path);
+
+        // Locate the manifest file within the latest snapshot directory
+        let manifest_path = latest_snapshot_path.join("epoch_ending.manifest");
+
+        if !manifest_path.exists() {
+            panic!("Manifest file not found in the latest snapshot directory.");
+        }
+
+        // Step 3: Prepare the database path
+        if db_path.exists() {
+            println!("Removing existing database at {:?}", db_path);
+            fs::remove_dir_all(db_path).expect("Failed to remove existing database directory");
+        }
+        fs::create_dir_all(db_path).expect("Failed to create database directory");
+
+        // Step 4: Set up the storage backend
+        let backup_storage = Arc::new(LocalFs::new(latest_snapshot_path.to_path_buf()));
+
+        // Step 5: Set up the RocksDB configuration
+        let db_configs = RocksdbConfigs::default();
+        let pruner_config = PrunerConfig::default();
+        let diem_db = DiemDB::open(db_path, false, pruner_config, db_configs, false, 0, 0)
+            .expect("Failed to open DiemDB");
+        let db_rw = DbReaderWriter::new(diem_db);
+
+        // Step 6: Create StateSnapshotRestoreOpt
+        let restore_opt = StateSnapshotRestoreOpt {
+            manifest_handle: Some(manifest_path),
+            version: 0,
+            validate_modules: false,
+            restore_mode: Default::default(),
+        };
+
+        // Create GlobalRestoreOptions
+        let global_restore_opts = GlobalRestoreOptions {
+            run_mode: Default::default(),
+            target_version: 0,
+            concurrent_downloads: 4,
+            trusted_waypoints: Arc::new(Default::default()),
+            replay_concurrency_level: 0,
+        };
+
+        // Step 7: Restore the database from the snapshot using the controller
+        let restore_controller = StateSnapshotRestoreController::new(
+            restore_opt,
+            global_restore_opts,
+            backup_storage,
+            None,
+        );
+
+        restore_controller
+            .run()
+            .await
+            .expect("Failed to restore database from snapshot");
+
+        println!(
+            "Database created successfully from snapshot at {:?}",
+            db_path.display()
+        );
+
+        Ok(())
+    }
 }
 
-#[ignore]
+//     async fn load_snapshot_into_db(
+//         snapshot_path: &Path,
+//         db_path: &Path,
+//     ) -> anyhow::Result<()> {
+//
+//         let storage_opt = DBToolStorageOpt {
+//             local_fs_dir: db_path.clone(),
+//             command_adapter_config: None,
+//         };
+//
+//         let restore_opt = StateSnapshotRestoreOpt {
+//             manifest_handle: snapshot_path.to_string_lossy().to_string(),
+//             version: 0,
+//             validate_modules: false,
+//             restore_mode: Default::default(),
+//         };
+//
+//         let global_opt = GlobalRestoreOpt {
+//             dry_run: false,
+//             db_dir: Some(PathBuf::from(db_path)),
+//             target_version: None,
+//             trusted_waypoints: Default::default(),
+//             rocksdb_opt: Default::default(),
+//             concurrent_downloads: Default::default(),
+//             replay_concurrency_level: Default::default(),
+//         };
+//
+//         let command = DiemCommand::Oneoff(Oneoff::StateSnapshot {
+//             storage: storage_opt,
+//             opt: restore_opt,
+//             global: global_opt,
+//         });
+//
+//         command.run().await?;
+//         Ok(())
+//     }
+// }
+
 #[test]
 fn test_twin_cl() -> anyhow::Result<()> {
     //use any db
@@ -515,11 +678,12 @@ fn test_twin_cl() -> anyhow::Result<()> {
         db_dir: prod_db_to_clone,
         oper_file: None,
         info: false,
+        snapshot_path: None,
     };
     twin.run();
     Ok(())
 }
-#[ignore]
+
 #[tokio::test]
 async fn test_twin_random() -> anyhow::Result<()> {
     //use any db

@@ -4732,6 +4732,8 @@ dependencies = [
  "libc",
  "libgit2-sys",
  "log",
+ "openssl-probe",
+ "openssl-sys",
  "url",
 ]
 
@@ -8323,9 +8325,11 @@ dependencies = [
  "bcs 0.1.4",
  "clap 4.5.4",
  "diem-api-types",
+ "diem-backup-cli",
  "diem-config",
  "diem-crypto",
  "diem-db",
+ "diem-db-tool",
  "diem-executor",
  "diem-forge",
  "diem-gas",
@@ -8338,6 +8342,7 @@ dependencies = [
  "diem-vm-types",
  "fs_extra",
  "futures-util",
+ "git2 0.15.0",
  "hex",
  "libra-config",
  "libra-framework",
